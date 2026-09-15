@@ -319,6 +319,7 @@ Prefix cache (RAM + SSD):
 
 MLX errors + threads:
 - **An MLX failure is CATCHABLE** (#353, `installErrorHandler`): `checkError` per chunk, `checkErrorDecode` per tick, a latched error never 200s; a swallowed failure DROPS its latch (`dropLatchedErrorUnless(had_error)`); never hand a null `mlx_array` to the tensor-map insert. Guard: `tests/test_mlx_error_recovery.sh`.
+- **A kernel that compiles LAZILY at first use owes a one-shot COMPILE PROBE** (latch handler first): a Metal internal error is a machine property — self-decline at the DISPATCH site, never fail the request; billing predicates stay untouched (`fused256ArmProbe`).
 - **Threads**: detach every conn thread; drain (`active_conn_threads` + `cancelAllInFlight`) BEFORE `scheduler.deinit`; handler sampling state outlives every pass (`Slot.in_pass`); an adopted spec cache has ONE owner (#266); sleep inhibition follows the inference-thread wait (#251, `tests/test_sleep_inhibit.sh`).
 - **A weight outside every warmup forward is still LAZY at serve time**: force-eval at init; DSpark is opt-in `--dspark`.
 - **Ownership by PROVENANCE, never content** (`{slice, owned}`).
