@@ -27,6 +27,17 @@ open "app/MLX-Serve.app"
 ## Server only
 
 ```bash
+./scripts/build.sh                                   # mlx + llama + Zig + ReleaseFast server
+./scripts/build.sh --sequoia                         # same, deployment floor 15.0 (see below)
+```
+
+It is one knob for the deployment floor: the target goes to `scripts/build-mlx.sh`
+(`MLX_DEPLOYMENT_TARGET`, which decides MLX's NAX gate **and** the Metal language
+version in `mlx.metallib`) and to `zig build -Dmin-os` (the executable's floor) in
+the same run, and refuses a floor below the `lib/mlx` that is already staged —
+that mismatch boots nowhere. What it runs, if you want to run the steps yourself:
+
+```bash
 ./scripts/fetch-zig.sh                               # stages the pinned Zig at .zig-toolchain/
 export PATH="$PWD/.zig-toolchain:$PATH"
 ./scripts/fetch-llama.sh && ./scripts/build-mlx.sh   # once, and again on a pin bump
@@ -38,6 +49,29 @@ zig build -Doptimize=ReleaseFast                     # always ReleaseFast; Debug
 Every release attaches `mlx-serve-linux-x64-cuda13.tar.gz` (RTX 20 to 50 series) and `mlx-serve-linux-arm64-cuda13.tar.gz` (GH200, Jetson Thor, DGX Spark). They need an NVIDIA driver 580 or newer, the CUDA 13 toolkit, cuDNN 9, OpenBLAS/LAPACKE, libwebp and the Avahi dns_sd compat library. Unpack into an empty folder (the tarball has no top-level directory) and run `zig-out/bin/mlx-serve`; it finds its libraries next to itself.
 
 To build on Linux, run `./scripts/build-linux.sh` from a fresh checkout. On Windows, `powershell -File scripts\build-windows.ps1` builds `mlx-serve.exe` into `dist\mlx-serve-windows-x64.zip`; it needs the Visual Studio 2022 C++ tools, CMake, Ninja, Git, the CUDA 13.0 toolkit and cuDNN 9, and running it needs an NVIDIA driver with CUDA 13 and cuDNN 9. Kernels, per-device defaults and memory: [CUDA.md](CUDA.md).
+
+## Installing a copy that runs anywhere
+
+`zig-out/bin/mlx-serve` finds its dylibs through `@loader_path/../../lib/...`, so
+it works inside the repo and nowhere else. `scripts/install.sh` makes it
+relocatable — into `~/opt/mlx-serve` with a link at `~/.local/bin/mlx-serve` by
+default:
+
+```bash
+./scripts/install.sh                                 # --dry-run first prints the plan
+./scripts/install.sh --prefix DIR --link PATH
+```
+
+It copies the binary, `LICENSE`/`LICENSE-APACHE-2.0`/`NOTICE`, `lib/mlx/lib/*.dylib`,
+`mlx.metallib`, `libllama`, and the webp dylibs the binary really links; rewrites
+`@rpath/…` and absolute Homebrew references onto `@executable_path/lib/…` and
+`@loader_path/…`; re-signs every dylib ad-hoc and then the binary
+(`install_name_tool` invalidates the linker signature; `release.yml` does the same
+with a Developer ID and `--options runtime`, which a local install must not copy);
+and fails if any reference that resolves on this machine only survives. It also
+removes a `lib/*.dylib` nothing links — a bundled-looking dylib that the binary
+resolves elsewhere hides the fact that the dependency is missing. Guard:
+`tests/test_install_prefix.sh`.
 
 ## Hermetic tests (Linux too)
 
@@ -55,5 +89,6 @@ The same step exists on a Mac and builds the same hermetic artifact, but it is *
 
 Release binaries need macOS 26.2+: their `mlx.metallib` is Metal language version
 4.0, which the Sequoia runtime refuses to load. A Sequoia build is the same
-build with a lowered deployment target — see
+build with a lowered deployment target — one flag in one place:
+`./scripts/build.sh --sequoia`, then `./scripts/install.sh`. See
 [building-sequoia.md](building-sequoia.md).
