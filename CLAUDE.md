@@ -78,6 +78,7 @@ Sampling defaults for omitted fields: body > launch flags > model `generation_co
 ## Building
 
 - First-time: `./scripts/fetch-zig.sh` stages the pinned Zig at `.zig-toolchain/`.
+- `scripts/build.sh` carries ONE deployment floor into both `MLX_DEPLOYMENT_TARGET` and `-Dmin-os` (`--sequoia` = 15.0); `scripts/install.sh` makes a relocatable install (rewire load commands, bundle webp, ad-hoc sign). Guard: `tests/test_install_prefix.sh`.
 - Zig caches configure-time subprocess output: after a toolchain/SDK change `rm -rf .zig-cache` or the link references a ghost path.
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
