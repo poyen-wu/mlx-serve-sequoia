@@ -42,3 +42,10 @@ zig build preview-test
 ```
 
 The same step exists on a Mac and builds the same hermetic artifact, but it is **not** a way to build without a staged mlx: `verifyBrewDeps` and `verifyMlxStage` run at configure time for every step, so `lib/mlx/` must already be built. On a Mac `zig build test` also compiles those files as part of the full suite.
+
+## macOS 15 (Sequoia)
+
+Release binaries need macOS 26.2+: their `mlx.metallib` is Metal language version
+4.0, which the Sequoia runtime refuses to load. A Sequoia build is the same
+build with a lowered deployment target — see
+[building-sequoia.md](building-sequoia.md).

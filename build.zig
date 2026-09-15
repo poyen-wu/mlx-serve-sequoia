@@ -30,9 +30,32 @@ pub fn build(b: *std.Build) void {
     // the binary with a clear dyld version error beats "loading" and dying on
     // the dylib. Matches app LSMinimumSystemVersion + Package.swift. Guard:
     // tests/test_mlx_staged_nax.sh (binary minos check).
+    //
+    // -Dmin-os lowers that floor together with scripts/build-mlx.sh's
+    // MLX_DEPLOYMENT_TARGET, which is how you build for macOS 15 (Sequoia,
+    // issue #230): mlx's NAX gate needs 26.2, and a metallib compiled at a 26.x
+    // min carries Metal language version 4.0 that Sequoia's Metal runtime
+    // refuses. Set both to 15.x and the whole tree runs on Sequoia.
+    // It goes through default_target rather than -Dtarget on purpose: an
+    // explicit target disables Zig's native CPU detection (-mcpu baseline),
+    // while a lowered os_version_min keeps the native arch AND cpu.
+    const min_os = b.option([]const u8, "min-os", "macOS deployment floor (default 26.2; use 15.0 for a Sequoia build)") orelse "26.2";
+    // "15", "15.0" and "15.0.0" all mean the same thing to a deployment floor,
+    // but SemanticVersion.parse demands all three fields.
+    const min_os_ver: std.SemanticVersion = blk: {
+        var parts = [_]u16{ 0, 0, 0 };
+        var n: usize = 0;
+        var it = std.mem.tokenizeScalar(u8, min_os, '.');
+        while (it.next()) |part| : (n += 1) {
+            if (n > 2) break :blk badMinOs(min_os);
+            parts[n] = std.fmt.parseInt(u16, part, 10) catch break :blk badMinOs(min_os);
+        }
+        if (n == 0) break :blk badMinOs(min_os);
+        break :blk .{ .major = parts[0], .minor = parts[1], .patch = parts[2] };
+    };
     const target = b.standardTargetOptions(.{
         .default_target = .{
-            .os_version_min = .{ .semver = .{ .major = 26, .minor = 2, .patch = 0 } },
+            .os_version_min = .{ .semver = min_os_ver },
         },
     });
     const optimize = b.standardOptimizeOption(.{});
@@ -688,6 +711,11 @@ fn readAppVersion(b: *std.Build) ?[]const u8 {
     const end = std.mem.indexOfPos(u8, bytes, start, "</string>") orelse return null;
     const v = std.mem.trim(u8, bytes[start..end], " \t\r\n");
     return if (v.len > 0) b.dupe(v) else null;
+}
+
+fn badMinOs(os: []const u8) noreturn {
+    std.debug.print("[mlx-serve] invalid -Dmin-os '{s}' — expected e.g. 26.2 or 15.0\n", .{os});
+    std.process.exit(1);
 }
 
 fn readMlxcPin(b: *std.Build) ?[]const u8 {
