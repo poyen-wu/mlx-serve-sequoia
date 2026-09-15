@@ -3032,6 +3032,56 @@ pub var fused256_override: ?bool = null;
 var fused256_env_cached: ?bool = null;
 var fused256_causal_env_cached: ?Fused256CausalMode = null;
 
+// One-shot compile probe for msv_attn_p256. A Metal COMPILER internal error
+// (driver/toolchain property, not our graph) surfaces only at the first real
+// eval — it used to fail the request AND every later one. The probe evaluates
+// the exact causal specialization on tiny synthetic arrays once, at the first
+// eligibility check; a failure permanently self-declines the kernel for the
+// process (composed sdpa path serves instead).
+var fused256_probe_state: std.atomic.Value(u8) = .init(0); // 0 unprobed, 1 failed, 2 ok
+pub var fused256_probe_fail_override: bool = false;
+
+pub fn fused256ProbeFailed() bool {
+    return fused256_probe_state.load(.acquire) == 1;
+}
+
+pub fn fused256ProbeReset() void {
+    fused256_probe_state.store(0, .release);
+}
+
+fn fused256RunCompileProbe() bool {
+    if (mlx.noGpuBackend()) return false;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return false;
+    const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 8, 16, 256 }, 0x51A2003) orelse return false;
+    defer _ = mlx.mlx_array_free(q);
+    const k = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 32, 256 }, 0x9A7E017) orelse return false;
+    defer _ = mlx.mlx_array_free(k);
+    const v = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 32, 256 }, 0xC0FFEE4) orelse return false;
+    defer _ = mlx.mlx_array_free(v);
+    // fusedSdpa256Impl (not the public gate) — the probe must not recurse.
+    const out = (fusedSdpa256Impl(s, q, k, v, 1.0 / 16.0, 0, null, null) catch return false) orelse return false;
+    defer _ = mlx.mlx_array_free(out);
+    if (mlx.mlx_array_eval(out) != 0) return false;
+    return true;
+}
+
+fn fused256ArmProbe() void {
+    if (fused256_probe_fail_override) {
+        fused256_probe_state.store(1, .release);
+        return;
+    }
+    if (fused256_probe_state.load(.acquire) != 0) return;
+    fused256_probe_state.store(3, .release); // in-progress; impl never re-enters here
+    mlx.installErrorHandler(); // idempotent; the probe must never hit the default exit(-1) handler
+    const ok = fused256RunCompileProbe();
+    var buf: [512]u8 = undefined;
+    if (mlx.takeError(&buf)) |msg| {
+        // A failed probe consumed its own error; never leave the latch armed.
+        log.warn("[fused-256] probe failed, composed sdpa serves hd-256 prefill: {s}\n", .{msg});
+    }
+    fused256_probe_state.store(if (ok) 2 else 1, .release);
+}
 pub fn fused256Enabled() bool {
     if (fused256_override) |v| return v;
     if (fused256_env_cached) |v| return v;
@@ -7798,6 +7848,12 @@ fn fusedSdpa256Impl(
     if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[0] != qs[0] or vs[0] != qs[0]) return null;
     const attn_dt = mlx.mlx_array_dtype(q);
     if ((attn_dt != .bfloat16 and attn_dt != .float16) or mlx.mlx_array_dtype(k) != attn_dt or mlx.mlx_array_dtype(v) != attn_dt) return null;
+
+    // Probe BEFORE any apply, even under the test override: a Metal compiler
+    // internal error must decline the kernel, never reach the default
+    // exit(-1) handler mid-request (or mid-test).
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return null;
 
     // K/V stage through `uint4` loads: an unaligned materialized view base
     // (e.g. the [3,259) slice of a padded cache) reads wrong values; decline
@@ -59300,6 +59356,10 @@ fn attn256Cosine(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 }
 
 test "fusedSdpa256Prefill: causal parity vs composed SDPA (GQA, ragged shapes, chunk offset)" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
+
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -59358,6 +59418,10 @@ fn attn256QsaMask(rnd: std.Random, qL: c_int, kL: c_int) !mlx.mlx_array {
 }
 
 test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ragged tiles, kv chunking)" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
+
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -59413,6 +59477,9 @@ fn attn256SliceLastDim(
 }
 
 test "fusedSdpa256Masked: a last-axis slice with an unaligned base declines and the fallback reads exactly" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
     // `[3,259)` has a 6-byte base: the row stride (264) is divisible by 8 so the
     // existing stride checks pass, but `msv_attn_p256`'s `uint4` K/V staging
     // reads wrong values. The gate must decline it and the caller's fallback
@@ -62329,6 +62396,10 @@ test "splitMaskedSdpa256: verify-width array-mask rows split through the vector 
 }
 
 test "fusedSdpa256Prefill: sliding-band parity vs composed 'array' mask (Gemma local layers)" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
+
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -62380,6 +62451,9 @@ test "fusedSdpa256Prefill: sliding-band parity vs composed 'array' mask (Gemma l
 }
 
 test "fusedSinkAttnPrefill: q/k 192, v 128 with sinks matches MLX sdpa (causal and band, with a cache prefix)" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
     // MiMo's attention: K 192 / V 128, GQA 8, a learned sink per head. The
     // reference is MLX's composed sdpa with the same sinks and an explicit mask.
     const s = mlx.gpuStream();
@@ -62470,6 +62544,10 @@ test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
 }
 
 test "fusedSdpa256Prefill: both arms FUSED off NAX, causal yields to stock ON NAX" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
+
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4A7E);
     const rnd = prng.random();
@@ -62515,6 +62593,32 @@ test "fusedSdpa256Prefill: both arms FUSED off NAX, causal yields to stock ON NA
     if (banded) |f| _ = mlx.mlx_array_free(f);
 }
 
+test "a failed compile probe permanently declines the fused hd-256 kernel" {
+    // Bar: a Metal compiler internal error must self-decline the kernel for the
+    // process (composed sdpa serves), never fail the request that tripped it.
+    // The decline lives at the DISPATCH site — the mode/billing predicates are
+    // untouched so admission guards keep their world.
+    fused256ProbeReset();
+    const saved_override = fused256_override;
+    fused256_override = true;
+    fused256_probe_fail_override = true;
+    defer {
+        fused256_override = saved_override;
+        fused256_probe_fail_override = false;
+        fused256ProbeReset();
+    }
+    const s = mlx.gpuStream();
+    const q = qsaProbeLcgBf16(s, &[_]c_int{ 1, 8, 16, 256 }, 0x51A2003) orelse return;
+    defer _ = mlx.mlx_array_free(q);
+    const k = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 32, 256 }, 0x9A7E017) orelse return;
+    defer _ = mlx.mlx_array_free(k);
+    const v = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 32, 256 }, 0xC0FFEE4) orelse return;
+    defer _ = mlx.mlx_array_free(v);
+    try std.testing.expect((try fusedSdpa256Prefill(s, q, k, v, 1.0 / 16.0, 0)) == null);
+    // The decline sticks across repeated gates (probe state is latched).
+    try std.testing.expect((try fusedSdpa256Prefill(s, q, k, v, 1.0 / 16.0, 40)) == null);
+}
+
 test "fused256KvChunkLen: BK alignment, one-block floor, kl cap, budget-off" {
     const t = std.testing;
     // budget <= 0: single dispatch covering the full key axis.
@@ -62530,6 +62634,10 @@ test "fused256KvChunkLen: BK alignment, one-block floor, kl cap, budget-off" {
 }
 
 test "fusedSdpa256Prefill: budgeted kv chunking engages and is exact vs single dispatch" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
+
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -62580,6 +62688,10 @@ test "fusedSdpa256Prefill: budgeted kv chunking engages and is exact vs single d
 }
 
 test "fusedSdpa256Prefill: band arm never chunks (single dispatch under a tiny budget)" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
+
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -62633,6 +62745,10 @@ test "fusedSdpa256Prefill: band arm never chunks (single dispatch under a tiny b
 }
 
 test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64-row tile)" {
+    // A machine whose Metal compiler cannot build the kernel skips rather than fails.
+    fused256ArmProbe();
+    if (fused256ProbeFailed()) return error.SkipZigTest;
+
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
