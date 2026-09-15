@@ -14,7 +14,11 @@
 # metallib = hard failure, never a quietly-degraded stage.
 #
 # Consequence of the 26.2 deployment target: the staged dylibs (and anything
-# bundling them) require macOS >= 26.2 at runtime.
+# bundling them) require macOS >= 26.2 at runtime. MLX_DEPLOYMENT_TARGET=15.x
+# builds for macOS 15 "Sequoia" instead (issue #230): no NAX, and a metallib at
+# a Metal language version the pre-Tahoe runtime can actually load — a 26.x
+# metallib is language version 4.0, which Sequoia refuses outright. The NAX and
+# minos assertions below then follow the target rather than assuming Tahoe.
 #
 # This is the single source of truth for the pinned mlx/mlx-c versions: the
 # submodule SHAs. Bump by checking out a new tag in the submodule; CI and
@@ -94,16 +98,51 @@ METALLIB="$STAGE/lib/mlx.metallib"
 [ -f "$METALLIB" ] || die "mlx.metallib not at $METALLIB — mlx changed its install layout"
 
 NAX_COUNT="$(strings "$METALLIB" | grep -c "_nax" || true)"
-[ "$NAX_COUNT" -gt 0 ] \
-  || die "built metallib contains ZERO *_nax kernels — the 26.2 gate failed silently (check SDK/deployment target/Metal Toolchain)"
 
 MINOS="$(otool -l "$STAGE/lib/libmlx.dylib" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')"
-case "$MINOS" in
-  26.[2-9]*|2[7-9]*|[3-9]*) ;;
-  *) die "libmlx.dylib minos '$MINOS' < 26.2 — deployment target did not take" ;;
+
+# ver_ge A B — dotted version compare; needed before the assertions below.
+ver_ge() {
+  local am aj bm bj
+  am=${1%%.*}; aj=$(echo "$1" | cut -d. -f2); aj=${aj:-0}
+  bm=${2%%.*}; bj=$(echo "$2" | cut -d. -f2); bj=${bj:-0}
+  [ "$am" -gt "$bm" ] || { [ "$am" -eq "$bm" ] && [ "$aj" -ge "$bj" ]; }
+}
+
+# Sequoia (and any pre-Tahoe) build: MLX_DEPLOYMENT_TARGET < 26.2. NAX kernels
+# cannot be compiled below 26.2, and a metallib built at a 26.x deployment
+# target carries Metal language version 4.0, which the macOS 15 Metal runtime
+# refuses to load ("language version 4.0 which is not supported on this OS").
+# So an old-OS build must have NAX OFF and minos at its own target — the
+# assertions follow the target instead of assuming Tahoe. MLX defines
+# MLX_METAL_NO_NAX here, which pins is_nax_available() to false: correct on
+# M1–M4 (NAX is M5-only) and the only option before Tahoe.
+NAX_EXPECT="${MLX_NAX_EXPECT:-auto}"
+if [ "$NAX_EXPECT" = auto ]; then
+  if ver_ge "$DEPLOYMENT_TARGET" 26.2; then
+    NAX_EXPECT=required
+  else
+    NAX_EXPECT=forbidden
+  fi
+fi
+
+case "$NAX_EXPECT:$NAX_COUNT" in
+  required:0)
+    die "built metallib contains ZERO *_nax kernels — the 26.2 gate failed silently (check SDK/deployment target/Metal Toolchain)" ;;
+  forbidden:0) ;;
+  forbidden:*)
+    die "metallib carries $NAX_COUNT *_nax symbol hits at deployment target $DEPLOYMENT_TARGET — the 26.2 NAX gate did not respect the target" ;;
+  *) ;;
 esac
+
+[ -n "$MINOS" ] || die "no LC_BUILD_VERSION minos on libmlx.dylib"
+# minos must come back at the target we asked for — a silently ignored
+# CMAKE_OSX_DEPLOYMENT_TARGET is exactly the failure that produces a
+# language-4.0 metallib on a build meant for an older OS.
+ver_ge "$MINOS" "$DEPLOYMENT_TARGET" \
+  || die "libmlx.dylib minos '$MINOS' < deployment target '$DEPLOYMENT_TARGET' — deployment target did not take"
 
 [ -f "$STAGE/lib/libmlxc.dylib" ] || die "libmlxc.dylib missing from stage"
 
 echo "$WANT" > "$STAMP"
-echo "[build-mlx] staged lib/mlx OK: $NAX_COUNT NAX symbol hits, minos $MINOS"
+echo "[build-mlx] staged lib/mlx OK: NAX expected=$NAX_EXPECT ($NAX_COUNT symbol hits), minos $MINOS"
