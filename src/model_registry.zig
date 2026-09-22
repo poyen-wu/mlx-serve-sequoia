@@ -28,6 +28,7 @@ const tokenize_cache_mod = @import("tokenize_cache.zig");
 const token_mask_mod = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
+const model_aliases = @import("model_aliases.zig");
 const io_util = @import("io_util.zig");
 const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
@@ -715,6 +716,11 @@ pub const ModelRegistry = struct {
     /// there, not here — the registry only carries the setting.
     idle_evict_secs: ?u32,
 
+    /// `~/.mlx-serve/model-aliases.json`: extra request ids that resolve to an
+    /// entry, read at boot and re-read by `rescan`. A registered id always wins
+    /// over an alias. Swapped under `mutex` (see `setAliases`).
+    aliases: model_aliases.Table,
+
     mutex: std.Io.Mutex,
     /// Broadcast whenever an entry's `state` changes. Connection threads
     /// blocked in `ensureLoaded` (on a `.loading`/`.evicting` entry) wake
@@ -753,6 +759,7 @@ pub const ModelRegistry = struct {
     ) !*ModelRegistry {
         const self = try allocator.create(ModelRegistry);
         errdefer allocator.destroy(self);
+        var alias_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -762,6 +769,7 @@ pub const ModelRegistry = struct {
             .max_resident_models = if (max_resident_models == 0) 1 else max_resident_models,
             .max_resident_mem = max_resident_mem,
             .idle_evict_secs = idle_evict_secs,
+            .aliases = model_aliases.load(allocator, io, model_aliases.defaultPath(&alias_path_buf)),
             .mutex = .init,
             .state_cond = .init,
             .current_resident_bytes = 0,
@@ -800,6 +808,7 @@ pub const ModelRegistry = struct {
             self.allocator.destroy(entry);
         }
         self.entries.deinit();
+        self.aliases.deinit();
         if (self.discovery) |*d| d.deinit();
     }
 
@@ -948,6 +957,9 @@ pub const ModelRegistry = struct {
     /// `--model`-only server) rescans nothing.
     pub fn rescan(self: *ModelRegistry) !u32 {
         const roots = if (self.discovery) |d| d.roots else &.{};
+        // An alias edit rides the same rescan: no restart. The defer runs after
+        // this body releases the mutex, which `reloadAliases` needs.
+        defer self.reloadAliases();
         if (roots.len == 0) return 0;
         var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer found.deinit();
@@ -991,7 +1003,43 @@ pub const ModelRegistry = struct {
     /// entry's `state` and its retained CPU state without the two drifting
     /// apart. Caller holds `mutex`.
     pub fn peekLocked(self: *ModelRegistry, id: []const u8) ?*LoadedModel {
-        return self.entries.get(id);
+        return self.resolveLocked(id);
+    }
+
+    /// `entries.get` plus the alias table: an alias naming a model id or a
+    /// model path resolves to that entry. A registered id always wins, so an
+    /// alias can never shadow a real model, and a dangling alias (target not
+    /// registered) resolves to nothing rather than to a guess. Caller holds
+    /// `mutex`.
+    fn resolveLocked(self: *ModelRegistry, id_or_alias: []const u8) ?*LoadedModel {
+        if (self.entries.get(id_or_alias)) |entry| return entry;
+        const target = self.aliases.targetFor(id_or_alias) orelse return null;
+        if (self.entries.get(target)) |entry| return entry;
+        return self.peekByPathLocked(target);
+    }
+
+    /// Replace the alias table (unit tests; production goes through
+    /// `reloadAliases`).
+    pub fn setAliases(self: *ModelRegistry, table: model_aliases.Table) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.setAliasesLocked(table);
+    }
+
+    fn setAliasesLocked(self: *ModelRegistry, table: model_aliases.Table) void {
+        self.aliases.deinit();
+        self.aliases = table;
+    }
+
+    /// Re-read `~/.mlx-serve/model-aliases.json` (missing/malformed = empty).
+    /// `POST /v1/models/rescan` calls it, so an edited file needs no restart.
+    pub fn reloadAliases(self: *ModelRegistry) void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        self.reloadAliasesFrom(model_aliases.defaultPath(&buf));
+    }
+
+    pub fn reloadAliasesFrom(self: *ModelRegistry, path: []const u8) void {
+        self.setAliases(model_aliases.load(self.allocator, self.io, path));
     }
 
     /// Resolve `id_or_empty` ("" or "mlx-serve" → default) to the entry.
@@ -1008,7 +1056,7 @@ pub const ModelRegistry = struct {
         if (id.len == 0) return error.NoDefaultModel;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.entries.get(id) orelse error.UnknownModelId;
+        return self.resolveLocked(id) orelse error.UnknownModelId;
     }
 
     /// Resolve `id` (or the default when `id` is null/empty/"mlx-serve")
@@ -1032,7 +1080,7 @@ pub const ModelRegistry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const entry = self.entries.get(id) orelse return error.UnknownModelId;
+        const entry = self.resolveLocked(id) orelse return error.UnknownModelId;
 
         while (true) {
             switch (entry.state) {
@@ -1459,6 +1507,72 @@ pub const ModelRegistry = struct {
 // covered by integration tests once Phase D lands.
 
 const testing = std.testing;
+
+test "ModelRegistry: an alias resolves by id and by path on every lookup" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStubWithArch("ddalcu/m", "/models/ddalcu/m", 64, "qwen3");
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(entry, 64);
+    reg.mutex.unlock(io);
+    reg.setAliases(try model_aliases.parse(testing.allocator,
+        \\{ "short": "ddalcu/m", "by-path": "/models/ddalcu/m/", "dangling": "org/gone" }
+    ));
+
+    try testing.expectEqual(@as(?*LoadedModel, entry), reg.peek("short"));
+    try testing.expectEqual(@as(?*LoadedModel, entry), reg.peek("by-path"));
+    // A target that isn't registered resolves to nothing, never to a guess.
+    try testing.expect(reg.peek("dangling") == null);
+    try testing.expect(reg.peek("not-an-alias") == null);
+
+    try testing.expectEqual(entry, try reg.resolveEntry("short"));
+    const loaded = try reg.ensureLoaded("by-path");
+    try testing.expectEqual(entry, loaded);
+    reg.release(loaded);
+}
+
+test "ModelRegistry: a registered id wins over an alias of the same name" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const real = try reg.registerStub("qwen", "/models/qwen-real", 64);
+    const other = try reg.registerStub("ddalcu/other", "/models/ddalcu/other", 64);
+    reg.setAliases(try model_aliases.parse(testing.allocator,
+        \\{ "qwen": "ddalcu/other" }
+    ));
+    try testing.expectEqual(@as(?*LoadedModel, real), reg.peek("qwen"));
+    try testing.expectEqual(@as(?*LoadedModel, other), reg.peek("ddalcu/other"));
+}
+
+test "ModelRegistry: an edited alias file applies on reload, old names go away" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("ddalcu/m", "/models/ddalcu/m", 64);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const file = try std.fmt.allocPrint(testing.allocator, "{s}/.zig-cache/tmp/{s}/model-aliases.json", .{ cwd, tmp.sub_path });
+    defer testing.allocator.free(file);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-aliases.json", .data = "{ \"first\": \"/models/ddalcu/m\" }" });
+    reg.reloadAliasesFrom(file);
+    try testing.expectEqual(@as(?*LoadedModel, entry), reg.peek("first"));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-aliases.json", .data = "{ \"second\": \"ddalcu/m\" }" });
+    reg.reloadAliasesFrom(file);
+    try testing.expectEqual(@as(?*LoadedModel, entry), reg.peek("second"));
+    try testing.expect(reg.peek("first") == null);
+
+    // A malformed file is empty, logged: aliases stop resolving, loads don't.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-aliases.json", .data = "{nope" });
+    reg.reloadAliasesFrom(file);
+    try testing.expect(reg.peek("second") == null);
+}
 
 fn makeReadyStub(reg: *ModelRegistry, id: []const u8, bytes: u64) !*LoadedModel {
     const stub = try reg.registerStub(id, id, bytes);

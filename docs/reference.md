@@ -265,6 +265,15 @@ Settings that follow the MODEL instead of the process. The server reads the file
 - **App**: `ModelSettingsFile`/`ModelOverride` (unknown keys survive a save), `ModelSettingsSheet` from the My Models row (context menu "Model Settings…", a `slider.horizontal.3` button when overrides exist) and from the context-overflow card when the model has an override (`ContextIncreaseTarget`). `AgentEngine.effectiveContextLength` prefers the SERVER's advertised context over the slider.
 - **Guards**: `model_settings.zig` unit tests, `tests/test_model_settings.sh` (boot + second model keeps globals + edit/unload/load + malformed file), Swift `ModelSettingsFileTests`.
 
+## Model aliases (`~/.mlx-serve/model-aliases.json`)
+
+A short id a client can put in `model` instead of the checkpoint directory's name. The registry resolves it; `/v1/models` advertises it. Nothing about an alias changes which entry is loaded, billed, cached or shared — resolution lands on the canonical `LoadedModel` and every downstream consumer sees its real `id` and `path`.
+
+- **File**: one object, alias → target, where the target is either a registered model **id** (`org/name` from a two-level `--model-dir` scan, or the basename a `--model` path registered) or the model's **absolute path**: `{"Qwen3.8-Flash-Next": "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit", "qwen-small": "/Users/me/.mlx-serve/models/mlx-community/Qwen2.5-0.5B-Instruct-4bit"}`. Read at `ModelRegistry.init` (`[aliases] N model alias(es) from …`), re-read by `POST /v1/models/rescan`, so an edit needs no restart. Missing/malformed = empty and `[aliases] … ignored`: a typo never stops the server.
+- **Precedence** (`ModelRegistry.resolveLocked`, the ONE place ids resolve): registered id → alias target by id → by path → nothing. So an alias can never shadow a real model, `"mlx-serve"` (the built-in default-model alias) and names with whitespace/`@` are refused by `nameOk`, and a target that isn't on disk yet simply resolves to nothing until it is. Unknown names keep their pinned `/v1/*` behavior (the default model answers) — an alias is a way to name the RIGHT model, not a way to 404.
+- **Report**: `"aliases": […]` on the model's row, ready and stub alike, sorted, omitted when empty. The Ollama surface needs nothing: `ollama.resolveName` already matches basename/substring.
+- **Guards**: `model_aliases.zig` + `ModelRegistry` unit tests (id/path targets, dangling target, id wins, reload swaps the table — red on revert of `resolveLocked`), `tests/test_model_aliases.sh` (private HOME; advertises, resolves, routes to its own entry and not the default, rescan applies an edit).
+
 ## Observability (`--metrics`) + optional API key (`--api-key`)
 
 Opt-in, performance-safe. Design contract: **zero cost when off** (a single `?*Metrics` null-check per REQUEST at `finishSlot`, never per token), negligible when on (per-request relaxed atomic adds off the decode path + a 2 s gauge sampler thread).

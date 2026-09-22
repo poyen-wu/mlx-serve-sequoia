@@ -28,6 +28,7 @@ const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
+const model_aliases = @import("model_aliases.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const stb = @import("stb");
@@ -6506,6 +6507,7 @@ fn renderModelEntry(
     allocator: std.mem.Allocator,
     io: std.Io,
     entry: *LoadedModel,
+    aliases: *const model_aliases.Table,
 ) ![]u8 {
     if (entry.state == .ready and entry.config != null and entry.chat_config != null) {
         const config = entry.config.?;
@@ -6555,6 +6557,10 @@ fn renderModelEntry(
         // config's modality marker ("flux2" for every image backend).
         const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
+        // `~/.mlx-serve/model-aliases.json` names a client can use instead of
+        // the checkpoint directory's id (empty fragment when it has none).
+        const aliases_part = try aliases.aliasesJson(allocator, model_id, entry.path);
+        defer allocator.free(aliases_part);
         const drafter_loaded = entry.drafter != null or entry.dflash != null;
         const mtp_loaded = entry.mtp != null;
         const drafter_path_json = if (drafter_loaded)
@@ -6589,9 +6595,10 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}"{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
+            aliases_part,
             nowSecs(io),
             entry.bytes_resident,
             bytes_on_disk_str,
@@ -6639,6 +6646,8 @@ fn renderModelEntry(
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
+    const stub_aliases = try aliases.aliasesJson(allocator, entry.id, entry.path);
+    defer allocator.free(stub_aliases);
     const err_part: []const u8 = if (entry.error_name) |name| blk: {
         // Inline escape to avoid double allocation; the names we emit
         // never contain quotes/backslashes (they're @errorName output).
@@ -6763,8 +6772,8 @@ fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":"{s}"{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ entry.id, stub_aliases, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 fn handleModels(
@@ -6816,7 +6825,7 @@ fn handleModels(
         for (ordered.items) |entry| {
             if (lan_filtered and !g_lan.?.sharedAllows(entry.id)) continue;
             if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
-            const json = try renderModelEntry(allocator, stream.io, entry);
+            const json = try renderModelEntry(allocator, stream.io, entry, &registry.aliases);
             defer allocator.free(json);
             try appendAliasedRow(allocator, &entries_buf, json, g_model_aliases.aliasForPath(stream.io, entry.path, &alias_buf));
         }
@@ -12471,6 +12480,12 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", "application/json", false) == null);
     // A PATH names its own entry, never the default: the unshared model's dir is denied.
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"/m/q\"}", "application/json", false) != null);
+
+    // An alias gates on the ENTRY it resolves to, never on the string the
+    // client sent: `g` is the shared model, `q` is the unshared one by path.
+    reg.setAliases(try model_aliases.parse(a, "{ \"g\": \"gemma-4-e4b-it-4bit\", \"q\": \"/m/q\" }"));
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"g\"}", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"q\"}", "application/json", false) != null);
 
     // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
     // the old blanket deny also 403'd the agent-sandbox guest, which reaches

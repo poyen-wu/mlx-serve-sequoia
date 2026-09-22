@@ -175,6 +175,8 @@
 
 ### Changes
 
+- A short name can stand in for a model: `~/.mlx-serve/model-aliases.json` maps e.g. `"Qwen3.8-Flash-Next"` to a model id or folder, `/v1/models` advertises the name, and any request can send it as `model`.
+
 - Qwen3.8 Flash Next processes prompts faster by fusing hyper-connection and GatedDeltaNet prefill operations.
 
 - Restarting the server now reuses the whole of a long conversation from the SSD cache again. A text prompt that happened to contain the id the model uses for images made the disk cache treat the conversation as if it began there, so a 73k-token chat resumed from 16k and spent 34 seconds re-reading itself instead of 1.6.

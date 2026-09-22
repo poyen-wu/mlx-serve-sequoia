@@ -42,6 +42,7 @@ test {
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
+    _ = @import("model_aliases.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("mtp.zig");
