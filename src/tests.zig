@@ -92,6 +92,7 @@ test {
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
     _ = @import("load_progress.zig");
+    _ = @import("model_aliases.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("lilicorr.zig");
