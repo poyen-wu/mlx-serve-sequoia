@@ -1915,6 +1915,14 @@ Two more came out of the first llmprobe run (all cells failing were ours):
 - Guard: `tests/test_hadamard_fidelity.sh` (server greedy logprobs vs a
   self-contained f32 reference, KL < 1e-5); red on the old engine.
 
+## A fixture-gated guard that SKIPS reports success (2026-09-21)
+
+Defect: a new hermetic guard — a Zig unit test reading a fixture path from `std.c.getenv` — passed under `zig build test -Dtest-filter=…` while reading nothing. The pass was the bug: the test body never ran.
+
+Cause: `zig build test` runs the test binary through a Run step with a clean environment, so `std.c.getenv("…")` returns null and the test returns `error.SkipZigTest`. Skipped tests exit 0 and print nothing at the `zig build` layer, so an env-gated test is indistinguishable from a passing one. The repo carries dozens of `*_TEST_MODEL`-gated tests that skip by design (they need a local checkpoint), which is why nothing noticed: the pattern LOOKS validated.
+
+Fix: a fixture the script itself wrote is not optional — build with the filter compiled in (`zig build test-build -Dtest-filter=…`) and run `zig-out/tests/test` directly with the env set, then assert the line ends `...OK`. Pair it with the inverse check: point the same binary at a missing fixture and require a FAILURE, because that is the assertion that proves the env reached it (`tests/test_ngram_bf16_table.sh` step [3]). Passing the env through `build.zig` (`setEnvironmentVariable` + `addFileInput`, the `QWEN_PREPROCESS_FIXTURE` precedent) is the alternative when the path is known at configure time.
+
 ## Qwen-Image-2.1: an 18 GB VAE decode on a 5 GB engine
 
 Defect: the first 1024² generation on the 4-bit pack reported an 18 GB peak process footprint; the staged engine holds 5.5 GB and the 40-step denoise is flat at that. `mlx_get_peak_memory` read 4.9 GB throughout, so nothing MLX-side pointed at it.

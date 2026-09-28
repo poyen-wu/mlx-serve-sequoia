@@ -67,7 +67,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 | `mtp.zig` | Qwen 3.5/3.6/3.8 native MTP head (sidecar OR in-checkpoint `mtp.*` via `resolveMtpSource`; per-weight quant re-solve; committed-history cache) |
 | `diffusion.zig` | DiffusionGemma block-diffusion canvas loop |
 | `deepseek_v4.zig` / `deepseek_v41.zig` | DeepSeek-V4 / V4.1 NATIVE archs (module-owned `dec_state`, NOT the KVCache) |
-| `qwen4_exp.zig` | Qwen3.8-Flash-Next (`qwen4_exp`) host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped 4-bit `ngram_table.bin` row gather. `ple_gpu.zig` = the same hash + gather as one Metal kernel over a no-copy wrap of the whole mapping (serial forwards). Trunk forward = `transformer.forwardQwen4With` (hyper-connections, PLE, QSA mask over `gatedFullAttnWith`) |
+| `qwen4_exp.zig` | Qwen3.8-Flash-Next (`qwen4_exp`) host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (4-bit affine, or raw BF16 rows at `bits:16`). `ple_gpu.zig` = the same hash + gather as one Metal kernel over a no-copy wrap of the whole mapping (serial forwards). Trunk forward = `transformer.forwardQwen4With` (hyper-connections, PLE, QSA mask over `gatedFullAttnWith`) |
 | `scheduler.zig` | Slots, inference thread (sole MLX caller), queues, batching, loop-stop guard, spec wiring, single-flight admission |
 | `round_cost.zig` | Measured per-model/width/KV-bucket spec round-cost table (`Transformer.round_cost`), persisted |
 | `model_discovery.zig` / `model_registry.zig` | Discovery (two-level org/name, multi-root, GGUF classification, stub meta), multi-model registry |
@@ -107,6 +107,8 @@ Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test red→fix→green, red-on-revert. Cross-arch = cover every touched arch. Refactor = characterization test first. UI/build scripts = factor a pure helper and test that.
 
 **Class bugs get class guards.** A live failure revealing a CLASS ships: the instance regression test; a corpus entry or universal invariant in `src/format_corpus_test.zig`; a rule here + story in `docs/gotchas/`.
+
+**An env-gated unit test SKIPS and `zig build test` still exits 0** (a Run step gets a clean environment, so `std.c.getenv` sees nothing): a HERMETIC fixture must be read by running the built binary (`zig build test-build -Dtest-filter=…` then `zig-out/tests/test`) and asserting it printed OK, never SKIP. Opt-in local-checkpoint tests may skip; a fixture the script just wrote may not.
 
 Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -Dtest-filter="tool traffic"` (the replay is gated behind `-Dslow-tests`; the bare filter compiles and reports success without running it). Full suite: `zig build test -Dslow-tests`. Full matrix: `tests/CLAUDE.md`.
 
