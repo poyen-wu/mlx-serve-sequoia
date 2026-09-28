@@ -829,6 +829,29 @@ test "ngram table raw bf16 rows copy out converted without scales" {
     try testing.expectEqualSlices(f32, &[_]f32{ -1.0, 0.5, -3.0, 3.0 }, &out);
 }
 
+test "ngram table opens a raw bf16 table patched out of a GGUF clone" {
+    // Cross-language bar: `tests/gguf_ple_to_ngram_table.py` patches a PLEBF16
+    // GGUF split into this shape and leaves a fixture whose payload byte k is
+    // `(k * 37) % 251`; what it writes is what `open` must read.
+    const path = std.mem.span(std.c.getenv("MLX_SERVE_NGRAM_BF16_FIXTURE") orelse return error.SkipZigTest);
+    var t = try NgramTable.open(path);
+    defer t.close();
+    try testing.expectEqual(@as(u32, 16), t.bits);
+    try testing.expectEqual(@as(u64, 8), t.rows);
+    try testing.expectEqual(@as(u32, 16), t.dim);
+    var out: [16]f32 = undefined;
+    var r: u64 = 0;
+    while (r < t.rows) : (r += 1) {
+        t.row(r, &out);
+        for (0..t.dim) |e| {
+            const k = 2 * (r * t.dim + @as(u64, e));
+            const lo: u16 = @intCast((k * 37) % 251);
+            const hi: u16 = @intCast(((k + 1) * 37) % 251);
+            try testing.expectEqual(bf16ToF32(lo | (@as(u16, hi) << 8)), out[e]);
+        }
+    }
+}
+
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
 /// the mmapped table. Non-null on `Transformer.qwen4` ⇒ the arch is served
 /// serially with speculation off (`ownsModuleDecodeState`), which is what
